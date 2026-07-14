@@ -6,7 +6,7 @@ import * as Sentry from '@sentry/node';
 
 const recordInputs = process.env.SENTRY_AI_RECORD_INPUTS === 'true';
 const recordOutputs = process.env.SENTRY_AI_RECORD_OUTPUTS === 'true';
-const tracesSampleRate = clampRate(process.env.SENTRY_TRACES_SAMPLE_RATE, 1);
+const tracesSampleRate = clampRate(process.env.SENTRY_TRACES_SAMPLE_RATE, 0);
 
 const SENTRY_AI_PROVIDER_INTEGRATIONS = new Set([
 	'Anthropic_AI',
@@ -27,7 +27,6 @@ Sentry.init({
 	traceLifecycle: 'stream',
 	streamGenAiSpans: true,
 	enableLogs: true,
-	sendDefaultPii: recordInputs || recordOutputs,
 	integrations: (defaults) =>
 		defaults.filter((integration) => !SENTRY_AI_PROVIDER_INTEGRATIONS.has(integration.name)),
 });
@@ -82,11 +81,14 @@ observe((event) => {
 	}
 });
 
+// Flush buffered events (notably Sentry Logs) on shutdown. This never calls
+// process.exit, so it does not race or override Flue's own SIGINT/SIGTERM
+// handling — it just flushes within the graceful-stop window Flue already keeps
+// open.
 if (process.env.SENTRY_DSN) {
-	const flush = () => void Sentry.flush(2000).finally(() => process.exit(0));
+	const flush = () => void Sentry.flush(2000);
 	process.once('SIGINT', flush);
 	process.once('SIGTERM', flush);
-	process.once('beforeExit', () => void Sentry.flush(2000));
 }
 
 function captureIncident(

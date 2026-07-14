@@ -46,15 +46,23 @@ pnpm install
 cp examples/sentry/.env.example examples/sentry/.env   # add SENTRY_DSN + ANTHROPIC_API_KEY
 ```
 
+Start the server, then invoke each workflow over HTTP:
+
 ```bash
 cd examples/sentry
-pnpm exec flue run assistant --target node --input '{"message":"Where is demo order A123?"}'
-pnpm exec flue run boom --target node
-pnpm exec flue run explicit --target node
+pnpm exec flue dev --target node
+```
+
+```bash
+curl -X POST 'http://localhost:3583/workflows/assistant?wait=result' \
+  -H 'content-type: application/json' -d '{"message":"Where is demo order A123?"}'
+curl -X POST 'http://localhost:3583/workflows/boom?wait=result' -H 'content-type: application/json'
+curl -X POST 'http://localhost:3583/workflows/explicit?wait=result' -H 'content-type: application/json'
 ```
 
 Each response carries a `runId` — the `flue.run.id` tag in Sentry. Open the
-run's trace to see its spans, logs, and any issue together. Without a
+run's trace to see its spans, logs, and any issue together. Traces and issues
+appear during the run; buffered logs flush when the server shuts down. Without a
 `SENTRY_DSN` the SDK runs disabled and the app is unchanged.
 
 ## Cloudflare

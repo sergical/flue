@@ -38,14 +38,14 @@ make one static source file target-agnostic.
 Use these environment variables unless the project already has an established
 Sentry convention:
 
-| Variable                    | Purpose                                                                                  |
-| --------------------------- | ---------------------------------------------------------------------------------------- |
-| `SENTRY_DSN`                | Project DSN; keep it configurable through the deployment environment.                    |
-| `SENTRY_ENVIRONMENT`        | Optional environment name such as `production` or `staging`.                             |
-| `SENTRY_RELEASE`            | Optional release identifier such as a commit SHA.                                        |
-| `SENTRY_TRACES_SAMPLE_RATE` | Tracing sample rate. `> 0` enables the gen_ai span hierarchy; `0` is errors + logs only. |
-| `SENTRY_AI_RECORD_INPUTS`   | Set to `true` to export prompts, system instructions, and tool arguments.                |
-| `SENTRY_AI_RECORD_OUTPUTS`  | Set to `true` to export model output and tool results.                                   |
+| Variable                    | Purpose                                                                                               |
+| --------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `SENTRY_DSN`                | Project DSN; keep it configurable through the deployment environment.                                 |
+| `SENTRY_ENVIRONMENT`        | Optional environment name such as `production` or `staging`.                                          |
+| `SENTRY_RELEASE`            | Optional release identifier such as a commit SHA.                                                     |
+| `SENTRY_TRACES_SAMPLE_RATE` | Tracing sample rate, default `0`. `> 0` enables the gen_ai span hierarchy; `0` is errors + logs only. |
+| `SENTRY_AI_RECORD_INPUTS`   | Set to `true` to export prompts, system instructions, and tool arguments.                             |
+| `SENTRY_AI_RECORD_OUTPUTS`  | Set to `true` to export model output and tool results.                                                |
 
 Never invent a DSN or hard-code it in application source. A Sentry DSN permits
 event submission but does not grant read access to project data. Update an
@@ -79,7 +79,7 @@ import * as Sentry from '@sentry/node';
 
 const recordInputs = process.env.SENTRY_AI_RECORD_INPUTS === 'true';
 const recordOutputs = process.env.SENTRY_AI_RECORD_OUTPUTS === 'true';
-const tracesSampleRate = clampRate(process.env.SENTRY_TRACES_SAMPLE_RATE, 1);
+const tracesSampleRate = clampRate(process.env.SENTRY_TRACES_SAMPLE_RATE, 0);
 
 const SENTRY_AI_PROVIDER_INTEGRATIONS = new Set([
   'Anthropic_AI',
@@ -100,7 +100,6 @@ Sentry.init({
   traceLifecycle: 'stream',
   streamGenAiSpans: true,
   enableLogs: true,
-  sendDefaultPii: recordInputs || recordOutputs,
   integrations: (defaults) =>
     defaults.filter((integration) => !SENTRY_AI_PROVIDER_INTEGRATIONS.has(integration.name)),
 });
@@ -160,11 +159,10 @@ export const cloudflare = extend({
         environment: env.SENTRY_ENVIRONMENT,
         release: env.SENTRY_RELEASE,
         attachStacktrace: true,
-        tracesSampleRate: Number(env.SENTRY_TRACES_SAMPLE_RATE ?? '1'),
+        tracesSampleRate: Number(env.SENTRY_TRACES_SAMPLE_RATE ?? '0') || 0,
         traceLifecycle: 'stream',
         streamGenAiSpans: true,
         enableLogs: true,
-        sendDefaultPii: recordInputs || recordOutputs,
         integrations: (defaults) =>
           defaults.filter((integration) => !SENTRY_AI_PROVIDER_INTEGRATIONS.has(integration.name)),
       }),
@@ -172,7 +170,7 @@ export const cloudflare = extend({
     ),
 });
 
-if (Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? '1') > 0) {
+if (Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? '0') > 0) {
   instrument(
     createOpenTelemetryInstrumentation({
       content: {
@@ -338,17 +336,21 @@ function clampRate(value: string | undefined, fallback: number): number {
 }
 ```
 
-On Node, add a flush on exit so short-lived `flue run` processes deliver pending
-events, then import the bridge once from the source-root `app.ts`:
+On Node, flush buffered events (notably Sentry Logs, which the SDK batches) on
+shutdown. Do not call `process.exit()` here — Flue's generated server already
+handles `SIGINT` / `SIGTERM`, awaits its lifecycle stop, and exits with the
+correct code; this handler only flushes within that window and must not race or
+override it.
 
 ```ts
 if (process.env.SENTRY_DSN) {
-  const flush = () => void Sentry.flush(2000).finally(() => process.exit(0));
+  const flush = () => void Sentry.flush(2000);
   process.once('SIGINT', flush);
   process.once('SIGTERM', flush);
-  process.once('beforeExit', () => void Sentry.flush(2000));
 }
 ```
+
+Import the bridge once from the source-root `app.ts`:
 
 ```ts title="src/app.ts"
 import './sentry.ts';
@@ -517,12 +519,12 @@ Remove the runtime event-type filter. The bridge continues to branch on the even
 
 ### Version 3 — 2026-07-14
 
-Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TRACES_SAMPLE_RATE > 0`, register Flue's OpenTelemetry instrumentation for the workflow/agent/model/tool span hierarchy with `traceLifecycle: 'stream'`; forward every `ctx.log.*` to Sentry Logs; and stop promoting error logs to issues, so issues remain limited to terminal failures. Content capture stays off by default. The diff below is the Node `sentry.ts`; on Cloudflare, initialize the SDK through the Durable Object wrapper instead of `Sentry.init(...)` and re-export `cloudflare` from each agent and workflow module.
+Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TRACES_SAMPLE_RATE > 0` (default `0`), register Flue's OpenTelemetry instrumentation for the workflow/agent/model/tool span hierarchy with `traceLifecycle: 'stream'`; forward every `ctx.log.*` to Sentry Logs; and stop promoting error logs to issues, so issues remain limited to terminal failures. Content capture stays off by default and is controlled only by the record flags, not `sendDefaultPii`. The diff below is the Node `sentry.ts`; on Cloudflare, initialize the SDK through the Durable Object wrapper instead of `Sentry.init(...)` and re-export `cloudflare` from each agent and workflow module.
 
 ```diff
 --- a/src/sentry.ts
 +++ b/src/sentry.ts
-@@ -1,101 +1,194 @@
+@@ -1,101 +1,196 @@
 -// flue-blueprint: tooling/sentry@2
 -import { type FlueEvent, observe } from '@flue/runtime';
 +// flue-blueprint: tooling/sentry@3
@@ -533,7 +535,7 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 
 +const recordInputs = process.env.SENTRY_AI_RECORD_INPUTS === 'true';
 +const recordOutputs = process.env.SENTRY_AI_RECORD_OUTPUTS === 'true';
-+const tracesSampleRate = clampRate(process.env.SENTRY_TRACES_SAMPLE_RATE, 1);
++const tracesSampleRate = clampRate(process.env.SENTRY_TRACES_SAMPLE_RATE, 0);
 +
 +const SENTRY_AI_PROVIDER_INTEGRATIONS = new Set([
 +	'Anthropic_AI',
@@ -560,7 +562,6 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 +	traceLifecycle: 'stream',
 +	streamGenAiSpans: true,
 +	enableLogs: true,
-+	sendDefaultPii: recordInputs || recordOutputs,
 +	integrations: (defaults) =>
 +		defaults.filter((integration) => !SENTRY_AI_PROVIDER_INTEGRATIONS.has(integration.name)),
  });
@@ -655,11 +656,14 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 -  error: unknown,
 -  tags: Record<string, string>,
 -  context?: Record<string, unknown>,
++// Flush buffered events (notably Sentry Logs) on shutdown. This never calls
++// process.exit, so it does not race or override Flue's own SIGINT/SIGTERM
++// handling — it just flushes within the graceful-stop window Flue already keeps
++// open.
 +if (process.env.SENTRY_DSN) {
-+	const flush = () => void Sentry.flush(2000).finally(() => process.exit(0));
++	const flush = () => void Sentry.flush(2000);
 +	process.once('SIGINT', flush);
 +	process.once('SIGTERM', flush);
-+	process.once('beforeExit', () => void Sentry.flush(2000));
 +}
 +
 +function captureIncident(
