@@ -43,7 +43,7 @@ Sentry convention:
 | `SENTRY_DSN`                | Project DSN; keep it configurable through the deployment environment.                                 |
 | `SENTRY_ENVIRONMENT`        | Optional environment name such as `production` or `staging`.                                          |
 | `SENTRY_RELEASE`            | Optional release identifier such as a commit SHA.                                                     |
-| `SENTRY_TRACES_SAMPLE_RATE` | Tracing sample rate, default `0`. `> 0` enables the gen_ai span hierarchy; `0` is errors + logs only. |
+| `SENTRY_TRACES_SAMPLE_RATE` | SDK-wide trace sample rate, default `0`. Values above `0` also enable the Flue gen_ai span hierarchy. |
 | `SENTRY_AI_RECORD_INPUTS`   | Set to `true` to export prompts, system instructions, and tool arguments.                             |
 | `SENTRY_AI_RECORD_OUTPUTS`  | Set to `true` to export model output and tool results.                                                |
 
@@ -51,6 +51,11 @@ Never invent a DSN or hard-code it in application source. A Sentry DSN permits
 event submission but does not grant read access to project data. Update an
 existing `.env.example`, environment type, or deployment documentation when the
 project maintains one, and preserve its deployment-configuration conventions.
+
+`SENTRY_TRACES_SAMPLE_RATE` is passed to the Sentry SDK and can sample non-AI
+instrumentation too. For production applications that need selective sampling,
+replace it with an application-owned `tracesSampler` while keeping a clear gate
+for the Flue instrumentation.
 
 ## Decide what may leave the application
 
@@ -95,7 +100,6 @@ Sentry.init({
   enabled: Boolean(process.env.SENTRY_DSN),
   environment: process.env.SENTRY_ENVIRONMENT ?? process.env.NODE_ENV,
   release: process.env.SENTRY_RELEASE,
-  attachStacktrace: true,
   tracesSampleRate,
   traceLifecycle: 'stream',
   streamGenAiSpans: true,
@@ -176,7 +180,6 @@ export const cloudflare = extend({
         enabled: Boolean(env.SENTRY_DSN),
         environment: env.SENTRY_ENVIRONMENT,
         release: env.SENTRY_RELEASE,
-        attachStacktrace: true,
         tracesSampleRate: clampRate(env.SENTRY_TRACES_SAMPLE_RATE, 0),
         traceLifecycle: 'stream',
         streamGenAiSpans: true,
@@ -243,15 +246,17 @@ teardowns.push(
 
     if (event.type === 'run_end') {
       runTags.delete(event.runId);
-      if (event.isError) captureIncident(event.error, tags, { durationMs: event.durationMs });
+      if (event.isError)
+        captureTerminalFailure(event.error, tags, { durationMs: event.durationMs });
       return;
     }
     if (event.type === 'operation' && event.isError && !event.runId) {
-      captureIncident(event.error, tags, {
+      captureTerminalFailure(event.error, tags, {
         durationMs: event.durationMs,
         operationKind: event.operationKind,
       });
-      if (event.submissionId && !event.dispatchId) capturedDirectSubmissions.add(event.submissionId);
+      if (event.submissionId && !event.dispatchId)
+        capturedDirectSubmissions.add(event.submissionId);
       return;
     }
     if (event.type === 'submission_settled' && event.outcome === 'failed') {
@@ -259,19 +264,16 @@ teardowns.push(
       // its `operation`; capture only reconciled failures that settled without a
       // live operation in this isolate.
       if (event.submissionId && capturedDirectSubmissions.delete(event.submissionId)) return;
-      captureIncident(event.error, tags);
+      captureTerminalFailure(event.error, tags);
       return;
     }
     if (event.type === 'log') {
-      const attributes = logAttributes(event);
-      if (event.level === 'info') Sentry.logger.info(event.message, attributes);
-      else if (event.level === 'warn') Sentry.logger.warn(event.message, attributes);
-      else Sentry.logger.error(event.message, attributes);
+      Sentry.logger[event.level](event.message, logAttributes(event));
     }
   }),
 );
 
-function captureIncident(
+function captureTerminalFailure(
   error: unknown,
   tags: Record<string, string>,
   context?: Record<string, unknown>,
@@ -573,7 +575,7 @@ Remove the runtime event-type filter. The bridge continues to branch on the even
 
 ### Version 3 — 2026-07-14
 
-Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TRACES_SAMPLE_RATE > 0` (default `0`), register Flue's OpenTelemetry instrumentation for the workflow/agent/model/tool span hierarchy with `traceLifecycle: 'stream'`; forward every `ctx.log.*` to Sentry Logs; and stop promoting error logs to issues, so issues remain limited to terminal failures — one per failure, deduplicating the `operation` and `submission_settled` events a failed direct submission both emit. Content capture stays off by default and is controlled only by the record flags, not `sendDefaultPii`. The diff below is the Node `sentry.ts`; on Cloudflare, initialize the SDK through the Durable Object wrapper instead of `Sentry.init(...)` and re-export `cloudflare` from each agent and workflow module.
+Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TRACES_SAMPLE_RATE > 0` (default `0`), register Flue's OpenTelemetry instrumentation for the workflow/agent/model/tool span hierarchy with `traceLifecycle: 'stream'`; forward every `ctx.log.*` to Sentry Logs; and stop promoting error logs to issues, so issues remain limited to terminal failures — one per failure, deduplicating the `operation` and `submission_settled` events a failed direct submission both emit. Remove `attachStacktrace`, which only affected the `captureMessage(...)` path this version removes. Content capture stays off by default and is controlled only by the record flags, not `sendDefaultPii`. The diff below is the Node `sentry.ts`; on Cloudflare, initialize the SDK through the Durable Object wrapper instead of `Sentry.init(...)` and re-export `cloudflare` from each agent and workflow module.
 
 ```diff
 --- a/src/sentry.ts
@@ -611,7 +613,6 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 +	enabled: Boolean(process.env.SENTRY_DSN),
 +	environment: process.env.SENTRY_ENVIRONMENT ?? process.env.NODE_ENV,
 +	release: process.env.SENTRY_RELEASE,
-+	attachStacktrace: true,
 +	tracesSampleRate,
 +	traceLifecycle: 'stream',
 +	streamGenAiSpans: true,
@@ -692,11 +693,11 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 -  }
 +	if (event.type === 'run_end') {
 +		runTags.delete(event.runId);
-+		if (event.isError) captureIncident(event.error, tags, { durationMs: event.durationMs });
++		if (event.isError) captureTerminalFailure(event.error, tags, { durationMs: event.durationMs });
 +		return;
 +	}
 +	if (event.type === 'operation' && event.isError && !event.runId) {
-+		captureIncident(event.error, tags, {
++		captureTerminalFailure(event.error, tags, {
 +			durationMs: event.durationMs,
 +			operationKind: event.operationKind,
 +		});
@@ -709,14 +710,11 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 +		// Skip the direct-submission failure already captured from its
 +		// `operation`; capture only reconciled failures with no live operation.
 +		if (event.submissionId && capturedDirectSubmissions.delete(event.submissionId)) return;
-+		captureIncident(event.error, tags);
++		captureTerminalFailure(event.error, tags);
 +		return;
 +	}
 +	if (event.type === 'log') {
-+		const attributes = logAttributes(event);
-+		if (event.level === 'info') Sentry.logger.info(event.message, attributes);
-+		else if (event.level === 'warn') Sentry.logger.warn(event.message, attributes);
-+		else Sentry.logger.error(event.message, attributes);
++		Sentry.logger[event.level](event.message, logAttributes(event));
 +	}
  });
 +teardowns.push(unobserve);
@@ -747,7 +745,7 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 +	for (const teardown of teardowns) teardown();
 +};
 +
-+function captureIncident(
++function captureTerminalFailure(
 +	error: unknown,
 +	tags: Record<string, string>,
 +	context?: Record<string, unknown>,

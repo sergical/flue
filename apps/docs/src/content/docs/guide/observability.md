@@ -1,7 +1,7 @@
 ---
 title: Observability
 description: Inspect workflow runs, monitor agent activity, and export telemetry from your application.
-lastReviewedAt: 2026-06-20
+lastReviewedAt: 2026-07-14
 ---
 
 Observability helps you understand whether Flue work completed, failed, became slow, or used more model resources than expected. Inspect workflow run history for bounded jobs, and use `observe(...)` to monitor workflows and continuing agents across your application.
@@ -84,11 +84,11 @@ Streaming deltas are best-effort live progress; use `message_end` as the authori
 
 ## Choose an observability provider
 
-| Provider                                                | Choose it when                                                                                                      |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| [OpenTelemetry](/docs/ecosystem/tooling/opentelemetry/) | You need vendor-neutral traces or already operate an OpenTelemetry-compatible backend.                              |
-| [Braintrust](/docs/ecosystem/tooling/braintrust/)       | You want content-bearing agent traces, model usage, costs, and evaluation-oriented debugging.                       |
-| [Sentry](/docs/ecosystem/tooling/sentry/)               | You primarily want actionable workflow failures and explicit error logs without exporting model content by default. |
+| Provider                                                | Choose it when                                                                                                          |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| [OpenTelemetry](/docs/ecosystem/tooling/opentelemetry/) | You need vendor-neutral traces or already operate an OpenTelemetry-compatible backend.                                  |
+| [Braintrust](/docs/ecosystem/tooling/braintrust/)       | You want content-bearing agent traces, model usage, costs, and evaluation-oriented debugging.                           |
+| [Sentry](/docs/ecosystem/tooling/sentry/)               | You want trace-connected terminal issues and application logs, with optional AI spans and model content off by default. |
 
 You can also consume `observe(...)` directly when these integrations do not match your telemetry or data-handling requirements.
 

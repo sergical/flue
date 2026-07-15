@@ -22,7 +22,6 @@ Sentry.init({
 	enabled: Boolean(process.env.SENTRY_DSN),
 	environment: process.env.SENTRY_ENVIRONMENT ?? process.env.NODE_ENV,
 	release: process.env.SENTRY_RELEASE,
-	attachStacktrace: true,
 	tracesSampleRate,
 	traceLifecycle: 'stream',
 	streamGenAiSpans: true,
@@ -80,15 +79,17 @@ teardowns.push(
 
 		if (event.type === 'run_end') {
 			runTags.delete(event.runId);
-			if (event.isError) captureIncident(event.error, tags, { durationMs: event.durationMs });
+			if (event.isError)
+				captureTerminalFailure(event.error, tags, { durationMs: event.durationMs });
 			return;
 		}
 		if (event.type === 'operation' && event.isError && !event.runId) {
-			captureIncident(event.error, tags, {
+			captureTerminalFailure(event.error, tags, {
 				durationMs: event.durationMs,
 				operationKind: event.operationKind,
 			});
-			if (event.submissionId && !event.dispatchId) capturedDirectSubmissions.add(event.submissionId);
+			if (event.submissionId && !event.dispatchId)
+				capturedDirectSubmissions.add(event.submissionId);
 			return;
 		}
 		if (event.type === 'submission_settled' && event.outcome === 'failed') {
@@ -96,14 +97,11 @@ teardowns.push(
 			// from its `operation`; capture only reconciled failures that settled
 			// without a live operation in this isolate.
 			if (event.submissionId && capturedDirectSubmissions.delete(event.submissionId)) return;
-			captureIncident(event.error, tags);
+			captureTerminalFailure(event.error, tags);
 			return;
 		}
 		if (event.type === 'log') {
-			const attributes = logAttributes(event);
-			if (event.level === 'info') Sentry.logger.info(event.message, attributes);
-			else if (event.level === 'warn') Sentry.logger.warn(event.message, attributes);
-			else Sentry.logger.error(event.message, attributes);
+			Sentry.logger[event.level](event.message, logAttributes(event));
 		}
 	}),
 );
@@ -131,7 +129,7 @@ reloadStore[RELOAD_TEARDOWN] = () => {
 	for (const teardown of teardowns) teardown();
 };
 
-function captureIncident(
+function captureTerminalFailure(
 	error: unknown,
 	tags: Record<string, string>,
 	context?: Record<string, unknown>,
