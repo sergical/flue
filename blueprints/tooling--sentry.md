@@ -104,8 +104,20 @@ Sentry.init({
     defaults.filter((integration) => !SENTRY_AI_PROVIDER_INTEGRATIONS.has(integration.name)),
 });
 
+// `flue dev` re-evaluates this module on every reload, but @flue/runtime's
+// instrumentation/observer registries and this process's signal listeners live
+// outside the reloaded module graph. Without cleanup each edit stacks another
+// bridge — and because the OpenTelemetry instrumentation is keyed, re-registering
+// it throws. Tear down the previous evaluation's registrations (kept on a
+// process-global under a shared Symbol) before wiring new ones, and collect this
+// evaluation's own teardowns.
+const RELOAD_TEARDOWN = Symbol.for('flue.sentry.teardown');
+const reloadStore = globalThis as unknown as { [key: symbol]: (() => void) | undefined };
+reloadStore[RELOAD_TEARDOWN]?.();
+const teardowns: Array<() => void> = [];
+
 if (tracesSampleRate > 0) {
-  instrument(
+  const dispose = instrument(
     createOpenTelemetryInstrumentation({
       content: {
         enabled: recordInputs || recordOutputs,
@@ -118,6 +130,7 @@ if (tracesSampleRate > 0) {
       },
     }),
   );
+  teardowns.push(() => void dispose());
 }
 ```
 
@@ -175,8 +188,15 @@ export const cloudflare = extend({
     ),
 });
 
+// Shared with the bridge below (each isolate evaluates this module once; the
+// teardown also makes Node `flue dev` reloads idempotent — see the Node note).
+const RELOAD_TEARDOWN = Symbol.for('flue.sentry.teardown');
+const reloadStore = globalThis as unknown as { [key: symbol]: (() => void) | undefined };
+reloadStore[RELOAD_TEARDOWN]?.();
+const teardowns: Array<() => void> = [];
+
 if (tracesSampleRate > 0) {
-  instrument(
+  const dispose = instrument(
     createOpenTelemetryInstrumentation({
       content: {
         enabled: recordInputs || recordOutputs,
@@ -189,6 +209,7 @@ if (tracesSampleRate > 0) {
       },
     }),
   );
+  teardowns.push(() => void dispose());
 }
 ```
 
@@ -203,44 +224,52 @@ Append this to `sentry.ts` after the target-specific code above:
 
 ```ts
 const runTags = new Map<string, Record<string, string>>();
+// A failed direct submission emits a rich `operation` failure (original error
+// name/message + duration/kind) and, later, a `submission_settled` whose
+// `serializeSubmissionError` collapses non-FlueError causes to a generic
+// "internal error". Capture the operation and remember its submissionId so we
+// drop the duplicate settlement while keeping the better error. Dispatched
+// submissions carry a `dispatchId` and never settle through observe().
+const capturedDirectSubmissions = new Set<string>();
 
-observe((event) => {
-  if (event.type === 'run_start' || event.type === 'run_resume') {
-    runTags.set(event.runId, { 'flue.workflow': event.workflowName });
-    return;
-  }
+teardowns.push(
+  observe((event) => {
+    if (event.type === 'run_start' || event.type === 'run_resume') {
+      runTags.set(event.runId, { 'flue.workflow': event.workflowName });
+      return;
+    }
 
-  const tags = correlationTags(event);
+    const tags = correlationTags(event);
 
-  if (event.type === 'run_end') {
-    runTags.delete(event.runId);
-    if (event.isError) captureIncident(event.error, tags, { durationMs: event.durationMs });
-    return;
-  }
-  if (event.type === 'operation' && event.isError && !event.runId) {
-    // A failed direct submission emits BOTH this `operation` and a
-    // `submission_settled` for the same `submissionId`. Capture it once, at the
-    // settlement (richer error metadata), by skipping the operation here.
-    // Dispatched submissions (which carry `dispatchId`) and non-submission
-    // top-level operations have no settlement event, so capture them here.
-    if (event.submissionId && !event.dispatchId) return;
-    captureIncident(event.error, tags, {
-      durationMs: event.durationMs,
-      operationKind: event.operationKind,
-    });
-    return;
-  }
-  if (event.type === 'submission_settled' && event.outcome === 'failed') {
-    captureIncident(event.error, tags);
-    return;
-  }
-  if (event.type === 'log') {
-    const attributes = logAttributes(event);
-    if (event.level === 'info') Sentry.logger.info(event.message, attributes);
-    else if (event.level === 'warn') Sentry.logger.warn(event.message, attributes);
-    else Sentry.logger.error(event.message, attributes);
-  }
-});
+    if (event.type === 'run_end') {
+      runTags.delete(event.runId);
+      if (event.isError) captureIncident(event.error, tags, { durationMs: event.durationMs });
+      return;
+    }
+    if (event.type === 'operation' && event.isError && !event.runId) {
+      captureIncident(event.error, tags, {
+        durationMs: event.durationMs,
+        operationKind: event.operationKind,
+      });
+      if (event.submissionId && !event.dispatchId) capturedDirectSubmissions.add(event.submissionId);
+      return;
+    }
+    if (event.type === 'submission_settled' && event.outcome === 'failed') {
+      // Skip the duplicate of a direct-submission failure already captured from
+      // its `operation`; capture only reconciled failures that settled without a
+      // live operation in this isolate.
+      if (event.submissionId && capturedDirectSubmissions.delete(event.submissionId)) return;
+      captureIncident(event.error, tags);
+      return;
+    }
+    if (event.type === 'log') {
+      const attributes = logAttributes(event);
+      if (event.level === 'info') Sentry.logger.info(event.message, attributes);
+      else if (event.level === 'warn') Sentry.logger.warn(event.message, attributes);
+      else Sentry.logger.error(event.message, attributes);
+    }
+  }),
+);
 
 function captureIncident(
   error: unknown,
@@ -361,9 +390,18 @@ runtime-owned awaited shutdown hook, which Flue does not yet expose.
 ```ts
 if (process.env.SENTRY_DSN) {
   const flush = () => void Sentry.flush(2000);
-  process.once('SIGINT', flush);
-  process.once('SIGTERM', flush);
+  process.on('SIGINT', flush);
+  process.on('SIGTERM', flush);
+  teardowns.push(() => {
+    process.off('SIGINT', flush);
+    process.off('SIGTERM', flush);
+  });
 }
+
+// Publish this evaluation's teardown so the next `flue dev` reload undoes it.
+reloadStore[RELOAD_TEARDOWN] = () => {
+  for (const teardown of teardowns) teardown();
+};
 ```
 
 Import the bridge once from the source-root `app.ts`:
@@ -582,8 +620,13 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 +		defaults.filter((integration) => !SENTRY_AI_PROVIDER_INTEGRATIONS.has(integration.name)),
  });
 
++const RELOAD_TEARDOWN = Symbol.for('flue.sentry.teardown');
++const reloadStore = globalThis as unknown as { [key: symbol]: (() => void) | undefined };
++reloadStore[RELOAD_TEARDOWN]?.();
++const teardowns: Array<() => void> = [];
++
 +if (tracesSampleRate > 0) {
-+	instrument(
++	const dispose = instrument(
 +		createOpenTelemetryInstrumentation({
 +			content: {
 +				enabled: recordInputs || recordOutputs,
@@ -596,11 +639,14 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 +			},
 +		}),
 +	);
++	teardowns.push(() => void dispose());
 +}
 +
  const runTags = new Map<string, Record<string, string>>();
++const capturedDirectSubmissions = new Set<string>();
 
- observe((event) => {
+-observe((event) => {
++const unobserve = observe((event) => {
 -  if (event.type === 'run_start' || event.type === 'run_resume') {
 -    runTags.set(event.runId, { 'flue.workflow': event.workflowName });
 -    return;
@@ -650,19 +696,19 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 +		return;
 +	}
 +	if (event.type === 'operation' && event.isError && !event.runId) {
-+		// A failed direct submission emits BOTH this `operation` and a
-+		// `submission_settled` for the same `submissionId`. Capture it once, at
-+		// the settlement (richer error metadata), by skipping the operation here.
-+		// Dispatched submissions (which carry `dispatchId`) and non-submission
-+		// top-level operations have no settlement event, so capture them here.
-+		if (event.submissionId && !event.dispatchId) return;
 +		captureIncident(event.error, tags, {
 +			durationMs: event.durationMs,
 +			operationKind: event.operationKind,
 +		});
++		// A direct submission also settles later with a generic error; remember it
++		// so we drop that duplicate and keep this operation's original error.
++		if (event.submissionId && !event.dispatchId) capturedDirectSubmissions.add(event.submissionId);
 +		return;
 +	}
 +	if (event.type === 'submission_settled' && event.outcome === 'failed') {
++		// Skip the direct-submission failure already captured from its
++		// `operation`; capture only reconciled failures with no live operation.
++		if (event.submissionId && capturedDirectSubmissions.delete(event.submissionId)) return;
 +		captureIncident(event.error, tags);
 +		return;
 +	}
@@ -673,6 +719,7 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 +		else Sentry.logger.error(event.message, attributes);
 +	}
  });
++teardowns.push(unobserve);
 
 -function captureException(
 -  error: unknown,
@@ -687,9 +734,18 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 +// run; only very-recently-buffered logs are at risk.
 +if (process.env.SENTRY_DSN) {
 +	const flush = () => void Sentry.flush(2000);
-+	process.once('SIGINT', flush);
-+	process.once('SIGTERM', flush);
++	process.on('SIGINT', flush);
++	process.on('SIGTERM', flush);
++	teardowns.push(() => {
++		process.off('SIGINT', flush);
++		process.off('SIGTERM', flush);
++	});
 +}
++
++// Publish this evaluation's teardown so the next `flue dev` reload undoes it.
++reloadStore[RELOAD_TEARDOWN] = () => {
++	for (const teardown of teardowns) teardown();
++};
 +
 +function captureIncident(
 +	error: unknown,
