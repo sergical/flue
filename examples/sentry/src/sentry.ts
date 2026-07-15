@@ -63,6 +63,12 @@ observe((event) => {
 		return;
 	}
 	if (event.type === 'operation' && event.isError && !event.runId) {
+		// A failed direct submission emits BOTH this `operation` and a
+		// `submission_settled` for the same `submissionId`. Capture it once, at
+		// the settlement (richer error metadata), by skipping the operation here.
+		// Dispatched submissions (which carry `dispatchId`) and non-submission
+		// top-level operations have no settlement event, so capture them here.
+		if (event.submissionId && !event.dispatchId) return;
 		captureIncident(event.error, tags, {
 			durationMs: event.durationMs,
 			operationKind: event.operationKind,
@@ -81,10 +87,14 @@ observe((event) => {
 	}
 });
 
-// Flush buffered events (notably Sentry Logs) on shutdown. This never calls
-// process.exit, so it does not race or override Flue's own SIGINT/SIGTERM
-// handling — it just flushes within the graceful-stop window Flue already keeps
-// open.
+// Best-effort flush of buffered events (notably Sentry Logs) on shutdown. This
+// never calls process.exit, so it cannot race or override Flue's own
+// SIGINT/SIGTERM handling. It is NOT a delivery guarantee: Flue's generated
+// server calls process.exit() right after `lifecycle.stop()` resolves, and Node
+// does not await promises started by signal listeners, so an in-flight flush can
+// be cut short when there is no other pending work. Traces and issues are sent
+// during the run; only very-recently-buffered logs are at risk. A guaranteed
+// drain needs a runtime-owned awaited shutdown hook (not yet exposed).
 if (process.env.SENTRY_DSN) {
 	const flush = () => void Sentry.flush(2000);
 	process.once('SIGINT', flush);

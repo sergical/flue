@@ -62,8 +62,10 @@ curl -X POST 'http://localhost:3583/workflows/explicit?wait=result' -H 'content-
 
 Each response carries a `runId` — the `flue.run.id` tag in Sentry. Open the
 run's trace to see its spans, logs, and any issue together. Traces and issues
-appear during the run; buffered logs flush when the server shuts down. Without a
-`SENTRY_DSN` the SDK runs disabled and the app is unchanged.
+are sent during the run; Sentry Logs are batched, so they trail the run and are
+flushed best-effort on shutdown (see the flush note in `src/sentry.ts` — logs
+buffered right before an immediate exit can be lost). Without a `SENTRY_DSN` the
+SDK runs disabled and the app is unchanged.
 
 ## Cloudflare
 

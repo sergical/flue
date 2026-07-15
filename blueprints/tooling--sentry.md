@@ -140,6 +140,11 @@ interface Env {
 
 const recordInputs = process.env.SENTRY_AI_RECORD_INPUTS === 'true';
 const recordOutputs = process.env.SENTRY_AI_RECORD_OUTPUTS === 'true';
+// Module-scope gate value. On Cloudflare, per-isolate `env` bindings are only
+// available inside the DO wrapper, so the module-scope `instrument(...)` gate
+// reads `process.env`; keep both paths going through `clampRate` so an invalid
+// rate (`-1`, `2`, `Infinity`, non-numeric) becomes `0` on both.
+const tracesSampleRate = clampRate(process.env.SENTRY_TRACES_SAMPLE_RATE, 0);
 
 const SENTRY_AI_PROVIDER_INTEGRATIONS = new Set([
   'Anthropic_AI',
@@ -159,7 +164,7 @@ export const cloudflare = extend({
         environment: env.SENTRY_ENVIRONMENT,
         release: env.SENTRY_RELEASE,
         attachStacktrace: true,
-        tracesSampleRate: Number(env.SENTRY_TRACES_SAMPLE_RATE ?? '0') || 0,
+        tracesSampleRate: clampRate(env.SENTRY_TRACES_SAMPLE_RATE, 0),
         traceLifecycle: 'stream',
         streamGenAiSpans: true,
         enableLogs: true,
@@ -170,7 +175,7 @@ export const cloudflare = extend({
     ),
 });
 
-if (Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? '0') > 0) {
+if (tracesSampleRate > 0) {
   instrument(
     createOpenTelemetryInstrumentation({
       content: {
@@ -213,6 +218,12 @@ observe((event) => {
     return;
   }
   if (event.type === 'operation' && event.isError && !event.runId) {
+    // A failed direct submission emits BOTH this `operation` and a
+    // `submission_settled` for the same `submissionId`. Capture it once, at the
+    // settlement (richer error metadata), by skipping the operation here.
+    // Dispatched submissions (which carry `dispatchId`) and non-submission
+    // top-level operations have no settlement event, so capture them here.
+    if (event.submissionId && !event.dispatchId) return;
     captureIncident(event.error, tags, {
       durationMs: event.durationMs,
       operationKind: event.operationKind,
@@ -336,11 +347,16 @@ function clampRate(value: string | undefined, fallback: number): number {
 }
 ```
 
-On Node, flush buffered events (notably Sentry Logs, which the SDK batches) on
-shutdown. Do not call `process.exit()` here — Flue's generated server already
-handles `SIGINT` / `SIGTERM`, awaits its lifecycle stop, and exits with the
-correct code; this handler only flushes within that window and must not race or
-override it.
+On Node, best-effort flush buffered events (notably Sentry Logs, which the SDK
+batches) on shutdown. Do not call `process.exit()` here — Flue's generated
+server already handles `SIGINT` / `SIGTERM`, awaits its lifecycle stop, and exits
+with the correct code; this handler only flushes and must not race or override
+it. Note this is not a delivery guarantee: the generated server calls
+`process.exit()` as soon as `lifecycle.stop()` resolves, and Node does not await
+promises started by a signal listener, so a flush still in flight can be cut
+short when no other work is pending. Traces and issues are sent during the run;
+only very-recently-buffered logs are at risk. Closing that gap fully needs a
+runtime-owned awaited shutdown hook, which Flue does not yet expose.
 
 ```ts
 if (process.env.SENTRY_DSN) {
@@ -519,7 +535,7 @@ Remove the runtime event-type filter. The bridge continues to branch on the even
 
 ### Version 3 — 2026-07-14
 
-Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TRACES_SAMPLE_RATE > 0` (default `0`), register Flue's OpenTelemetry instrumentation for the workflow/agent/model/tool span hierarchy with `traceLifecycle: 'stream'`; forward every `ctx.log.*` to Sentry Logs; and stop promoting error logs to issues, so issues remain limited to terminal failures. Content capture stays off by default and is controlled only by the record flags, not `sendDefaultPii`. The diff below is the Node `sentry.ts`; on Cloudflare, initialize the SDK through the Durable Object wrapper instead of `Sentry.init(...)` and re-export `cloudflare` from each agent and workflow module.
+Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TRACES_SAMPLE_RATE > 0` (default `0`), register Flue's OpenTelemetry instrumentation for the workflow/agent/model/tool span hierarchy with `traceLifecycle: 'stream'`; forward every `ctx.log.*` to Sentry Logs; and stop promoting error logs to issues, so issues remain limited to terminal failures — one per failure, deduplicating the `operation` and `submission_settled` events a failed direct submission both emit. Content capture stays off by default and is controlled only by the record flags, not `sendDefaultPii`. The diff below is the Node `sentry.ts`; on Cloudflare, initialize the SDK through the Durable Object wrapper instead of `Sentry.init(...)` and re-export `cloudflare` from each agent and workflow module.
 
 ```diff
 --- a/src/sentry.ts
@@ -634,6 +650,12 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 +		return;
 +	}
 +	if (event.type === 'operation' && event.isError && !event.runId) {
++		// A failed direct submission emits BOTH this `operation` and a
++		// `submission_settled` for the same `submissionId`. Capture it once, at
++		// the settlement (richer error metadata), by skipping the operation here.
++		// Dispatched submissions (which carry `dispatchId`) and non-submission
++		// top-level operations have no settlement event, so capture them here.
++		if (event.submissionId && !event.dispatchId) return;
 +		captureIncident(event.error, tags, {
 +			durationMs: event.durationMs,
 +			operationKind: event.operationKind,
@@ -656,10 +678,13 @@ Add AI tracing and log forwarding to the error-reporting bridge. When `SENTRY_TR
 -  error: unknown,
 -  tags: Record<string, string>,
 -  context?: Record<string, unknown>,
-+// Flush buffered events (notably Sentry Logs) on shutdown. This never calls
-+// process.exit, so it does not race or override Flue's own SIGINT/SIGTERM
-+// handling — it just flushes within the graceful-stop window Flue already keeps
-+// open.
++// Best-effort flush of buffered events (notably Sentry Logs) on shutdown. This
++// never calls process.exit, so it cannot race or override Flue's own
++// SIGINT/SIGTERM handling. It is NOT a delivery guarantee: the generated server
++// calls process.exit() right after `lifecycle.stop()` resolves, and Node does
++// not await promises started by a signal listener, so an in-flight flush can be
++// cut short when no other work is pending. Traces and issues are sent during the
++// run; only very-recently-buffered logs are at risk.
 +if (process.env.SENTRY_DSN) {
 +	const flush = () => void Sentry.flush(2000);
 +	process.once('SIGINT', flush);
